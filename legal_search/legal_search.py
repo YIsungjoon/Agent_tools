@@ -27,13 +27,29 @@ def legal_search(query: str, target: str = "ls", action: str = "search", law_id:
     target_clean = str(target).strip().lower()
     query_clean = str(query).strip()
 
-    # Map target schemas to National Law Information Center OpenAPI standards
-    # target=ls -> law, target=prec -> prec, target=adRul -> adRul
-    api_target = "law"
-    if target_clean == "prec":
-        api_target = "prec"
-    elif target_clean == "adrul":
-        api_target = "adRul"
+    # Map target schemas to National Law Information Center OpenAPI standards dynamically
+    target_map = {
+        "ls": "law",
+        "law": "law",
+        "법령": "law",
+        "prec": "prec",
+        "판례": "prec",
+        "adrul": "adRul",
+        "행정규칙": "adRul",
+        "ordin": "ordin",
+        "larul": "ordin",
+        "local": "ordin",
+        "자치법규": "ordin",
+        "detc": "detc",
+        "헌재결정례": "detc",
+        "lsty": "lsty",
+        "법령해석례": "lsty",
+        "depr": "depr",
+        "행정심판례": "depr"
+    }
+    
+    # Use mapped standard value, fallback to target_clean to support custom sub-agency targets (e.g. molit, moel, ftc, etc.)
+    api_target = target_map.get(target_clean, target_clean)
 
     # 1. LIVE OPENAPI MODE (Activated if LAW_GO_OC credential is set)
     if oc_key:
@@ -77,6 +93,13 @@ def legal_search(query: str, target: str = "ls", action: str = "search", law_id:
                         dec_date = item.findtext("선고일자") or "N/A"
                         case_no = item.findtext("사건번호") or "N/A"
                         md += f"| {idx+1} | `{prec_id}` | **{case_name}** ({case_no}) | 선고일: {dec_date} |\n"
+                elif api_target == "ordin":
+                    items = root.findall(".//ordin") or root.findall(".//laRul") or root.findall(".//item")
+                    for idx, item in enumerate(items[:15]):
+                        ordin_id = item.findtext("자치법규일련번호") or item.findtext("자치법규ID") or item.findtext("일련번호") or item.findtext("ID") or "N/A"
+                        ordin_name = item.findtext("자치법규명") or item.findtext("자치법규명한글") or item.findtext("법규명") or "이름 없음"
+                        pub_date = item.findtext("공포일자") or "N/A"
+                        md += f"| {idx+1} | `{ordin_id}` | **{ordin_name}** | 공포일: {pub_date} |\n"
                 else:
                     # Generic parser fallback
                     for idx, child in enumerate(root.findall(".//item") or root.findall("./*")[:15]):
@@ -100,15 +123,24 @@ def legal_search(query: str, target: str = "ls", action: str = "search", law_id:
                         search_xml = search_resp.read()
                     
                     search_root = ET.fromstring(search_xml)
-                    first_item = search_root.find(".//law") if api_target == "law" else search_root.find(".//prec")
+                    if api_target == "law":
+                        first_item = search_root.find(".//law")
+                    elif api_target == "prec":
+                        first_item = search_root.find(".//prec")
+                    elif api_target == "ordin":
+                        first_item = search_root.find(".//ordin") or search_root.find(".//laRul") or search_root.find(".//item")
+                    else:
+                        first_item = search_root.find(".//item")
+
                     if first_item is not None:
-                        target_id = first_item.findtext("법령일련번호") or first_item.findtext("판례정보일련번호")
+                        target_id = first_item.findtext("자치법규일련번호") or first_item.findtext("자치법규ID") or first_item.findtext("법령일련번호") or first_item.findtext("판례정보일련번호") or first_item.findtext("ID")
                 
                 if not target_id:
                     return f"Error: Action 'detail' requires a valid 'law_id' or a specific searchable 'query' title."
                 
-                # Call lawService.do for detail
-                service_url = f"https://www.law.go.kr/DRF/lawService.do?OC={oc_key}&target={api_target}&ID={target_id}&type=XML"
+                # Call lawService.do for detail. For ordin, MST parameter is preferred.
+                id_param = "MST" if api_target == "ordin" else "ID"
+                service_url = f"https://www.law.go.kr/DRF/lawService.do?OC={oc_key}&target={api_target}&{id_param}={target_id}&type=XML"
                 req = urllib.request.Request(service_url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=5) as service_resp:
                     detail_xml = service_resp.read()
@@ -116,7 +148,7 @@ def legal_search(query: str, target: str = "ls", action: str = "search", law_id:
                 detail_root = ET.fromstring(detail_xml)
                 
                 # Standard law extraction
-                title = detail_root.findtext("법령명한글") or detail_root.findtext("사건명") or "상세 정보"
+                title = detail_root.findtext("법령명한글") or detail_root.findtext("사건명") or detail_root.findtext("자치법규명") or detail_root.findtext("자치법규명한글") or "상세 정보"
                 pub_date = detail_root.findtext("공포일자") or detail_root.findtext("선고일자") or "N/A"
                 
                 content_lines = []
