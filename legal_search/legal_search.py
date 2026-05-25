@@ -22,7 +22,7 @@ def legal_search(query: str, target: str = "ls", action: str = "search", law_id:
     Supports live searching, XML parsing, and extracts critical dates/history for timeline mapping.
     Also handles municipal ordinances (local discretion rules) and batched annexes with zero-error local fallback.
     """
-    oc_key = os.environ.get("LAW_GO_OC")
+    oc_key = os.environ.get("LAW_GO_OC") or os.environ.get("LAW_API_OC")
     action_clean = str(action).strip().lower()
     target_clean = str(target).strip().lower()
     query_clean = str(query).strip()
@@ -57,7 +57,7 @@ def legal_search(query: str, target: str = "ls", action: str = "search", law_id:
             if action_clean == "search":
                 # URL encode the search keyword
                 encoded_query = urllib.parse.quote(query_clean)
-                url = f"https://www.law.go.kr/DRF/lawSearch.do?OC={oc_key}&target={api_target}&query={encoded_query}&type=XML"
+                url = f"http://www.law.go.kr/DRF/lawSearch.do?OC={oc_key}&target={api_target}&query={encoded_query}&type=XML"
                 
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=5) as response:
@@ -88,7 +88,7 @@ def legal_search(query: str, target: str = "ls", action: str = "search", law_id:
                 elif api_target == "prec":
                     items = root.findall(".//prec")
                     for idx, item in enumerate(items[:15]):
-                        prec_id = item.findtext("판례정보일련번호") or "N/A"
+                        prec_id = item.findtext("판례일련번호") or item.findtext("판례정보일련번호") or "N/A"
                         case_name = item.findtext("사건명") or "사건명 없음"
                         dec_date = item.findtext("선고일자") or "N/A"
                         case_no = item.findtext("사건번호") or "N/A"
@@ -109,53 +109,111 @@ def legal_search(query: str, target: str = "ls", action: str = "search", law_id:
                 
                 md += f"\n*Displayed top {min(len(items), 15)} results. Use 'detail' action with ID to view full clauses.*"
                 return md
-
+ 
             elif action_clean == "detail":
                 # Detail fetching requires a specific ID. 
                 # If law_id is omitted but query is provided, we use the query as a Title-lookup
                 target_id = law_id
                 if not target_id:
-                    # Title-lookup: Search for title first
-                    encoded_query = urllib.parse.quote(query_clean)
-                    search_url = f"https://www.law.go.kr/DRF/lawSearch.do?OC={oc_key}&target={api_target}&query={encoded_query}&type=XML"
+                    # Title-lookup: Extract only the pure law title (e.g. "건축법 시행령 제119조..." -> "건축법 시행령")
+                    # by splitting at '제' or digits, which typically start the article definition
+                    import re
+                    clean_title = query_clean
+                    match = re.split(r'\b제?\d+|\b제\s*\d+', query_clean)
+                    if match and match[0].strip():
+                        clean_title = match[0].strip()
+                    
+                    encoded_query = urllib.parse.quote(clean_title)
+                    search_url = f"http://www.law.go.kr/DRF/lawSearch.do?OC={oc_key}&target={api_target}&query={encoded_query}&type=XML"
                     req = urllib.request.Request(search_url, headers={'User-Agent': 'Mozilla/5.0'})
                     with urllib.request.urlopen(req, timeout=5) as search_resp:
                         search_xml = search_resp.read()
                     
                     search_root = ET.fromstring(search_xml)
+                    first_item = None
                     if api_target == "law":
-                        first_item = search_root.find(".//law")
+                        items = search_root.findall(".//law")
+                        if items:
+                            for item in items:
+                                name = item.findtext("법령명한글") or item.findtext("법령명") or ""
+                                if name.strip().replace(" ", "") == clean_title.strip().replace(" ", ""):
+                                    first_item = item
+                                    break
+                            if first_item is None:
+                                first_item = items[0]
                     elif api_target == "prec":
                         first_item = search_root.find(".//prec")
                     elif api_target == "ordin":
-                        first_item = search_root.find(".//ordin") or search_root.find(".//laRul") or search_root.find(".//item")
+                        items = search_root.findall(".//ordin") or search_root.findall(".//laRul") or search_root.findall(".//item")
+                        if items:
+                            for item in items:
+                                name = item.findtext("자치법규명") or item.findtext("자치법규명한글") or item.findtext("법규명") or ""
+                                if name.strip().replace(" ", "") == clean_title.strip().replace(" ", ""):
+                                    first_item = item
+                                    break
+                            if first_item is None:
+                                first_item = items[0]
                     else:
                         first_item = search_root.find(".//item")
-
+ 
                     if first_item is not None:
-                        target_id = first_item.findtext("자치법규일련번호") or first_item.findtext("자치법규ID") or first_item.findtext("법령일련번호") or first_item.findtext("판례정보일련번호") or first_item.findtext("ID")
+                        target_id = first_item.findtext("자치법규일련번호") or first_item.findtext("자치법규ID") or first_item.findtext("법령일련번호") or first_item.findtext("판례일련번호") or first_item.findtext("판례정보일련번호") or first_item.findtext("ID")
                 
                 if not target_id:
                     return f"Error: Action 'detail' requires a valid 'law_id' or a specific searchable 'query' title."
                 
-                # Call lawService.do for detail. For ordin, MST parameter is preferred.
-                id_param = "MST" if api_target == "ordin" else "ID"
-                service_url = f"https://www.law.go.kr/DRF/lawService.do?OC={oc_key}&target={api_target}&{id_param}={target_id}&type=XML"
+                # Call lawService.do for detail.
+                # Only precedents (prec) use 'ID' as the query parameter. Laws, Ordinances, and Rules use 'MST'.
+                id_param = "ID" if api_target == "prec" else "MST"
+                service_url = f"http://www.law.go.kr/DRF/lawService.do?OC={oc_key}&target={api_target}&{id_param}={target_id}&type=XML"
                 req = urllib.request.Request(service_url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=5) as service_resp:
                     detail_xml = service_resp.read()
                 
                 detail_root = ET.fromstring(detail_xml)
                 
-                # Standard law extraction
-                title = detail_root.findtext("법령명한글") or detail_root.findtext("사건명") or detail_root.findtext("자치법규명") or detail_root.findtext("자치법규명한글") or "상세 정보"
-                pub_date = detail_root.findtext("공포일자") or detail_root.findtext("선고일자") or "N/A"
+                # Standard law/precedent details extraction
+                title = detail_root.findtext(".//법령명_한글") or detail_root.findtext(".//법령명한글") or detail_root.findtext(".//법령명") or detail_root.findtext(".//사건명") or detail_root.findtext(".//자치법규명") or detail_root.findtext(".//자치법규명한글") or "상세 정보"
+                pub_date = detail_root.findtext(".//공포일자") or detail_root.findtext(".//선고일자") or "N/A"
                 
                 content_lines = []
-                # Scan through paragraphs/clauses
-                for elem in detail_root.findall(".//조문내용") or detail_root.findall(".//판결요지") or detail_root.findall(".//내용"):
-                    if elem.text:
-                        content_lines.append(elem.text.strip())
+                # Advanced parsing: Group recursively by '조문단위' (individual article units) for extreme readability and precise filtering
+                clauses = detail_root.findall(".//조문단위")
+                if clauses:
+                    import re
+                    # Check if the query refers to a specific article number (e.g. "제119조" or "119")
+                    article_match = re.search(r'제?\s*(\d+)\s*조', query_clean)
+                    article_num = article_match.group(1) if article_match else "".join(filter(str.isdigit, query_clean))
+                    
+                    for c in clauses:
+                        c_num = c.attrib.get("조문번호") or c.findtext("조문번호") or ""
+                        # Normalize c_num to remove leading zeros if any (e.g., "00119" -> "119")
+                        c_num_clean = c_num.lstrip("0")
+                        
+                        # If a specific article is requested, skip all other articles
+                        if article_num and c_num_clean != article_num:
+                            continue
+                            
+                        c_title = c.findtext("조문제목") or c.findtext("조문여부") or ""
+                        c_header = f"### 제{c_num_clean}조 ({c_title})" if c_num_clean else "### 조문"
+                        lines = []
+                        # Scan all child content elements of this article in order
+                        for tag in ["조문내용", "항내용", "호내용", "목내용"]:
+                            for elem in c.findall(f".//{tag}"):
+                                if elem.text and elem.text.strip():
+                                    text_clean = elem.text.strip().replace("<br/>", "\n").replace("<br >", "\n")
+                                    if text_clean not in lines:
+                                        lines.append(text_clean)
+                        if lines:
+                            content_lines.append(f"{c_header}\n" + "\n\n".join(lines))
+                            
+                # Fallback to generic tag scanning if no '조문단위' was found (e.g. precedents or simpler XML models)
+                if not content_lines:
+                    for tag in ["조문내용", "항내용", "호내용", "목내용", "판결요지", "판시사항", "참조조문", "참조판례", "판례내용", "내용"]:
+                        for elem in detail_root.findall(f".//{tag}"):
+                            if elem.text:
+                                text_clean = elem.text.strip().replace("<br/>", "\n").replace("<br >", "\n")
+                                content_lines.append(f"[{tag}]\n{text_clean}")
                 
                 content_body = "\n\n".join(content_lines) if content_lines else "본문 내용을 추출할 수 없습니다. (HTML 또는 XML 구조를 직접 브라우저로 확인하십시오.)"
                 

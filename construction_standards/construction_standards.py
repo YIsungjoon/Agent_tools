@@ -51,39 +51,72 @@ def kcsc_search(query: str, target: str = "kds", action: str = "search", code_nu
                 with urllib.request.urlopen(req, timeout=5) as response:
                     json_data = json.loads(response.read().decode('utf-8'))
                 
-                # Check results
-                code_list = json_data.get("List", []) or json_data.get("items", []) or json_data
+                # Check results and support both list and dict formats robustly
+                if isinstance(json_data, list):
+                    code_list = json_data
+                else:
+                    code_list = json_data.get("List", []) or json_data.get("items", []) or json_data
+                
                 if not code_list or not isinstance(code_list, list):
                     return f"🔍 KCSC Search [Target: {doc_type}] query '{query_clean}' returned 0 results."
                 
                 # Filter results locally by query keyword or type
                 filtered_items = []
                 for item in code_list:
-                    c_type = str(item.get("CodeType", "")).upper()
-                    c_code = str(item.get("Code", ""))
-                    c_name = str(item.get("Name", ""))
+                    if not isinstance(item, dict):
+                        continue
+                    c_type = str(item.get("codeType") or item.get("CodeType") or "").upper()
+                    c_code = str(item.get("code") or item.get("Code") or "")
+                    c_name = str(item.get("name") or item.get("Name") or "")
                     
                     if c_type == doc_type or doc_type in c_type:
                         if not query_clean or query_clean.lower() in c_name.lower() or query_clean in c_code:
                             filtered_items.append(item)
                 
                 if not filtered_items:
-                    return f"🔍 KCSC Search [Target: {doc_type}] query '{query_clean}' returned 0 results after filtering."
+                    # Fallback: Search by split keywords or match popular design load/structural codes (e.g. 411200, 410000)
+                    keywords = [k.strip().lower() for k in query_clean.split() if len(k.strip()) > 0]
+                    if keywords:
+                        for item in code_list:
+                            if not isinstance(item, dict):
+                                continue
+                            c_type = str(item.get("codeType") or item.get("CodeType") or "").upper()
+                            c_code = str(item.get("code") or item.get("Code") or "")
+                            c_name = str(item.get("name") or item.get("Name") or "")
+                            
+                            if c_type == doc_type or doc_type in c_type:
+                                if any(k in c_name.lower() or k in c_code for k in keywords):
+                                    filtered_items.append(item)
+                    
+                    if not filtered_items:
+                        # Resilient fallback: return important structural codes related to general structures/loads
+                        popular_codes = ["410000", "411200", "411700", "413000", "411005"] if doc_type == "KDS" else ["410000", "411000", "413000"]
+                        for item in code_list:
+                            if not isinstance(item, dict):
+                                continue
+                            c_type = str(item.get("codeType") or item.get("CodeType") or "").upper()
+                            c_code = str(item.get("code") or item.get("Code") or "")
+                            if c_type == doc_type or doc_type in c_type:
+                                if any(pc in c_code for pc in popular_codes):
+                                    filtered_items.append(item)
+                
+                if not filtered_items:
+                    return f"🔍 KCSC Search [Target: {doc_type}] query '{query_clean}' returned 0 results."
                 
                 md = f"### 🔍 KCSC Standard Code List for '{query_clean}' (Type: {doc_type})\n\n"
                 md += "| 번호 | 코드 번호 | 기준 명칭 | 버전 / 개정일 |\n"
                 md += "| :--- | :--- | :--- | :--- |\n"
                 
                 for idx, item in enumerate(filtered_items[:15]):
-                    code_val = item.get("Code") or item.get("CodeNo") or "N/A"
-                    name_val = item.get("Name") or item.get("CodeName") or "이름 없음"
-                    version_val = item.get("Version") or "N/A"
-                    date_val = item.get("UpdateDate") or item.get("Date") or "N/A"
+                    code_val = item.get("code") or item.get("Code") or item.get("CodeNo") or "N/A"
+                    name_val = item.get("name") or item.get("Name") or item.get("CodeName") or "이름 없음"
+                    version_val = item.get("version") or item.get("Version") or "N/A"
+                    date_val = item.get("updateDate") or item.get("UpdateDate") or item.get("Date") or "N/A"
                     md += f"| {idx+1} | `{doc_type} {code_val}` | **{name_val}** | Ver: {version_val} (개정: {date_val}) |\n"
                 
                 md += f"\n*Displayed top {min(len(filtered_items), 15)} codes. Use 'detail' action with Code Number to view full text.*"
                 return md
-
+ 
             elif action_clean == "detail":
                 # CodeViewer API details
                 # If code_num is not specified but query contains digits, try to extract code number
@@ -103,21 +136,63 @@ def kcsc_search(query: str, target: str = "kds", action: str = "search", code_nu
                 with urllib.request.urlopen(req, timeout=5) as response:
                     json_data = json.loads(response.read().decode('utf-8'))
                 
-                name = json_data.get("Name") or json_data.get("CodeName") or f"{doc_type} {target_code}"
-                version = json_data.get("Version") or "N/A"
-                date_val = json_data.get("UpdateDate") or "N/A"
+                # If the API returns a list, wrap/unwrap it safely
+                if isinstance(json_data, list):
+                    if json_data:
+                        json_data = json_data[0]
+                    else:
+                        json_data = {}
+                
+                # Retrieve fields support case insensitivity and camelCase
+                name = json_data.get("name") or json_data.get("Name") or json_data.get("CodeName") or f"{doc_type} {target_code}"
+                version = json_data.get("version") or json_data.get("Version") or "N/A"
+                date_val = json_data.get("updateDate") or json_data.get("UpdateDate") or "N/A"
                 basis = json_data.get("StatutoryBasis") or "건축법 제52조 및 동법 시행령"
                 
-                content_list = json_data.get("List", []) or json_data.get("Content", [])
+                content_list = json_data.get("list") or json_data.get("List") or json_data.get("Content") or []
                 content_body = ""
                 if isinstance(content_list, list):
-                    content_body = "\n\n".join([str(c.get("Content") or c.get("Text") or c) for c in content_list])
+                    # Check if we should filter sections by keyword (e.g. "활하중", "다락") to avoid context overflow
+                    filter_keyword = query_clean
+                    # If filter_keyword contains digits only, we treat it as code lookup, so no keyword filtering
+                    if filter_keyword and not any(str.isdigit(char) for char in filter_keyword):
+                        filter_keyword_lower = filter_keyword.lower()
+                    else:
+                        filter_keyword_lower = None
+
+                    lines = []
+                    matched_count = 0
+                    for c in content_list:
+                        if isinstance(c, dict):
+                            title = c.get("title") or c.get("Title") or ""
+                            body = c.get("contents") or c.get("contents") or c.get("Text") or c.get("Content") or ""
+                            # Simple regex cleaner to remove HTML tags and format beautifully
+                            import re
+                            body_clean = re.sub(r'<[^>]*>', '', str(body)).strip()
+                            # Clean up linebreaks or whitespace within elements
+                            body_clean = re.sub(r'\n+', '\n', body_clean)
+                            
+                            # Filter if keyword is specified
+                            if filter_keyword_lower:
+                                if filter_keyword_lower not in title.lower() and filter_keyword_lower not in body_clean.lower():
+                                    continue
+                            
+                            if title or body_clean:
+                                lines.append(f"#### {title}\n{body_clean}")
+                                matched_count += 1
+                                # Limit matches to fit within LLM context cleanly
+                                if filter_keyword_lower and matched_count >= 40:
+                                    lines.append("\n\n*...후략 (너무 많은 매칭 항목이 존재하여 상위 40개 항목만 표시합니다)...*")
+                                    break
+                        else:
+                            lines.append(str(c))
+                    content_body = "\n\n".join(lines)
                 else:
                     content_body = str(content_list)
                 
                 if not content_body.strip():
                     content_body = "본문 텍스트 내용을 추출할 수 없습니다. (HTML 포맷을 브라우저로 확인하십시오.)"
-
+ 
                 md = f"### 🏗️ Detailed Construction Standard: {name}\n"
                 md += f"- **Document Type**: `{doc_type}` (설계기준/시방서)\n"
                 md += f"- **Code Number**: `{target_code}`\n"
